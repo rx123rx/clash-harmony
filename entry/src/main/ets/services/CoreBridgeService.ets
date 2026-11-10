@@ -157,6 +157,30 @@ export class CoreBridgeService {
     }
   }
 
+  static startTunAsync(configPath: string, tunFd: number): CoreBridgeState {
+    try {
+      return rememberState(nativeCore.startTunAsync(configPath, tunFd) as CoreBridgeState);
+    } catch (err) {
+      return rememberState(fallbackState(configPath, tunFd, stringifyError(err)));
+    }
+  }
+
+  static async waitForTunStart(maxAttempts: number = 240, intervalMs: number = 500): Promise<CoreBridgeState> {
+    let state: CoreBridgeState = CoreBridgeService.getState();
+    for (let index = 0; index < maxAttempts; index++) {
+      if (state.coreMode !== 'starting') {
+        return state;
+      }
+      if (index < maxAttempts - 1) {
+        await new Promise<void>((resolve: () => void) => {
+          setTimeout(resolve, intervalMs);
+        });
+        state = CoreBridgeService.getState();
+      }
+    }
+    return state;
+  }
+
   static stopTun(): CoreBridgeState {
     try {
       return rememberState(nativeCore.stopTun() as CoreBridgeState);

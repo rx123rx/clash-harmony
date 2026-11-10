@@ -291,10 +291,14 @@ struct Index {
         return;
       }
 
-      this.statusMessage = 'VPN 已启动，等待核心...';
+      this.statusMessage = 'VPN 已启动，正在解析配置并等待核心...';
       this.coreBridgeState = CoreBridgeService.getState();
       hilog.info(LOG_DOMAIN, LOG_TAG, 'toggleVpn: waiting for controller');
-      const controllerReady: ControllerStatus = await MihomoControllerService.waitForVersion(3, 800);
+      // MihomoStart parses the full subscription synchronously inside the VPN
+      // extension. Large subscriptions can take much longer than the old two
+      // 800ms retry intervals; stopping the extension early interrupts startup before the
+      // controller gets a chance to listen.
+      const controllerReady: ControllerStatus = await MihomoControllerService.waitForVersion(240, 500);
       this.controllerStatus = controllerReady;
       hilog.info(LOG_DOMAIN, LOG_TAG, 'toggleVpn: controller ready=%{public}s', controllerReady.available ? 'true' : 'false');
 
@@ -311,7 +315,7 @@ struct Index {
         this.summary = CoreService.createSummary(this.profileState, false);
         this.vpnActionText = '连接';
         this.coreBridgeState = CoreBridgeService.getState();
-        this.statusMessage = `核心未响应：${controllerReady.message}`;
+        this.statusMessage = `等待核心启动超时：${controllerReady.message}`;
         this.recordLog('warn', this.statusMessage);
         return;
       }

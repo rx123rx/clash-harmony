@@ -40,6 +40,7 @@ export interface ForwarderStats {
 }
 
 export const startTun: (configPath: string, tunFd: number) => NativeCoreState;
+export const startTunAsync: (configPath: string, tunFd: number) => NativeCoreState;
 export const stopTun: () => NativeCoreState;
 export const startCore: (configPath: string) => NativeCoreState;
 export const stopCore: () => NativeCoreState;

@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <memory>
+#include <new>
+#include <pthread.h>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -41,6 +44,13 @@ struct RuntimeState {
 std::mutex g_stateMutex;
 RuntimeState g_state;
 TunForwarder g_forwarder;
+bool g_tunStartInProgress = false;
+bool g_tunStopRequested = false;
+
+struct AsyncTunStartTask {
+    std::string configPath;
+    int32_t nativeFd = -1;
+};
 
 napi_value CreateString(napi_env env, const std::string& value)
 {
@@ -91,6 +101,71 @@ void RefreshAdapterStateLocked()
     g_state.adapterLoadError = MihomoAdapterLoadError();
     g_state.supportsControllerOnly = MihomoSupportsControllerOnly();
     g_state.supportsTunAttach = MihomoSupportsTunAttach();
+}
+
+void* AsyncTunStartWorker(void* opaque)
+{
+    std::unique_ptr<AsyncTunStartTask> task(static_cast<AsyncTunStartTask*>(opaque));
+    const int startResult = MihomoStart(task->configPath.c_str(), task->nativeFd);
+    const char* rawVersion = startResult == 0 ? MihomoVersion() : nullptr;
+    const std::string adapterVersion = rawVersion == nullptr ? "" : rawVersion;
+    const char* rawError = startResult == 0 ? nullptr : MihomoLastError();
+    const std::string startError = rawError == nullptr || rawError[0] == '\0'
+        ? "mihomo start failed"
+        : rawError;
+
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        if (!g_tunStopRequested && g_state.nativeFd == task->nativeFd && startResult == 0) {
+            g_state.running = true;
+            g_state.controllerOnly = false;
+            g_state.tunAttached = true;
+            g_state.realConnectionReady = false;
+            RefreshAdapterStateLocked();
+            g_state.adapterVersion = adapterVersion;
+            g_state.version = adapterVersion;
+            g_state.lastError.clear();
+            if (g_state.adapterMode == "real" && g_state.adapterKind == "mihomo") {
+                g_state.coreMode = "mihomo-adapter";
+                g_state.realConnectionReady = true;
+            } else {
+                g_state.coreMode = "adapter-stub";
+                g_forwarder.Start(g_state.nativeFd, nullptr, SocketProtector::Protect);
+            }
+            g_tunStartInProgress = false;
+            return nullptr;
+        }
+    }
+
+    g_forwarder.Stop();
+    MihomoStop();
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        if (g_state.nativeFd == task->nativeFd) {
+            CloseNativeFdLocked();
+            g_state.running = false;
+            g_state.tunFd = -1;
+            g_state.controllerReady = false;
+            g_state.controllerOnly = false;
+            g_state.tunAttached = false;
+            g_state.realConnectionReady = false;
+            g_state.adapterVersion.clear();
+            g_state.controllerVersion.clear();
+            g_state.version.clear();
+            RefreshAdapterStateLocked();
+            if (g_tunStopRequested) {
+                g_state.coreMode = "stopped";
+                g_state.lastError.clear();
+                g_state.stopCount += 1;
+            } else {
+                g_state.coreMode = "error";
+                g_state.lastError = startError;
+            }
+        }
+        g_tunStartInProgress = false;
+        g_tunStopRequested = false;
+    }
+    return nullptr;
 }
 
 napi_value CreateStateObject(napi_env env)
@@ -229,26 +304,121 @@ napi_value StartTun(napi_env env, napi_callback_info info)
     return CreateStateObject(env);
 }
 
+napi_value StartTunAsync(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    std::string configPath;
+    int32_t tunFd = -1;
+    const bool ok = argc >= 2 && ReadStringArg(env, args[0], configPath) &&
+                    napi_get_value_int32(env, args[1], &tunFd) == napi_ok;
+
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        if (g_tunStartInProgress) {
+            g_state.lastError = "mihomo start already in progress";
+        } else {
+            g_state.startCount += 1;
+            g_state.configPath = configPath;
+            g_state.tunFd = tunFd;
+            g_state.controllerReady = false;
+            g_state.controllerOnly = false;
+            g_state.tunAttached = false;
+            g_state.realConnectionReady = false;
+            g_state.adapterVersion.clear();
+            g_state.controllerVersion.clear();
+            g_state.version.clear();
+            g_state.lastError.clear();
+            RefreshAdapterStateLocked();
+            CloseNativeFdLocked();
+
+            if (!ok || configPath.empty() || tunFd < 0) {
+                g_state.running = false;
+                g_state.coreMode = "error";
+                g_state.lastError = "invalid configPath or tunFd";
+            } else {
+                const int32_t duplicateFd = dup(tunFd);
+                if (duplicateFd < 0) {
+                    g_state.running = false;
+                    g_state.coreMode = "error";
+                    g_state.lastError = std::string("dup tunFd failed: ") + strerror(errno);
+                } else {
+                    auto* task = new (std::nothrow) AsyncTunStartTask { configPath, duplicateFd };
+                    if (task == nullptr) {
+                        close(duplicateFd);
+                        g_state.running = false;
+                        g_state.coreMode = "error";
+                        g_state.lastError = "allocate mihomo start task failed";
+                    } else {
+                        g_state.nativeFd = duplicateFd;
+                        g_state.running = false;
+                        g_state.coreMode = "starting";
+                        g_tunStopRequested = false;
+                        g_tunStartInProgress = true;
+
+                        pthread_attr_t attr;
+                        const int attrResult = pthread_attr_init(&attr);
+                        int createResult = attrResult;
+                        if (attrResult == 0) {
+                            constexpr size_t GO_WORKER_STACK_SIZE = 8 * 1024 * 1024;
+                            const int stackResult = pthread_attr_setstacksize(&attr, GO_WORKER_STACK_SIZE);
+                            const int detachResult = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                            pthread_t worker {};
+                            if (stackResult == 0 && detachResult == 0) {
+                                createResult = pthread_create(&worker, &attr, AsyncTunStartWorker, task);
+                            } else {
+                                createResult = stackResult != 0 ? stackResult : detachResult;
+                            }
+                            pthread_attr_destroy(&attr);
+                        }
+
+                        if (createResult != 0) {
+                            delete task;
+                            CloseNativeFdLocked();
+                            g_state.coreMode = "error";
+                            g_state.lastError = std::string("mihomo worker create failed: ") + strerror(createResult);
+                            g_tunStartInProgress = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return CreateStateObject(env);
+}
+
 napi_value StopTun(napi_env env, napi_callback_info info)
 {
     (void)info;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
-        g_forwarder.Stop();
-        MihomoStop();
-        CloseNativeFdLocked();
-        g_state.running = false;
-        g_state.tunFd = -1;
-        g_state.controllerReady = false;
-        g_state.controllerOnly = false;
-        g_state.tunAttached = false;
-        g_state.realConnectionReady = false;
-        g_state.adapterVersion.clear();
-        g_state.controllerVersion.clear();
-        g_state.version.clear();
-        RefreshAdapterStateLocked();
-        g_state.coreMode = "stopped";
-        g_state.stopCount += 1;
+        if (g_tunStartInProgress) {
+            g_tunStopRequested = true;
+            g_state.running = false;
+            g_state.controllerReady = false;
+            g_state.coreMode = "stopping";
+            g_state.lastError = "mihomo startup cancellation requested";
+        } else {
+            g_forwarder.Stop();
+            MihomoStop();
+            CloseNativeFdLocked();
+            g_state.running = false;
+            g_state.tunFd = -1;
+            g_state.controllerReady = false;
+            g_state.controllerOnly = false;
+            g_state.tunAttached = false;
+            g_state.realConnectionReady = false;
+            g_state.adapterVersion.clear();
+            g_state.controllerVersion.clear();
+            g_state.version.clear();
+            RefreshAdapterStateLocked();
+            g_state.coreMode = "stopped";
+            g_state.stopCount += 1;
+            g_tunStopRequested = false;
+        }
     }
     return CreateStateObject(env);
 }
@@ -374,7 +544,12 @@ napi_value GetState(napi_env env, napi_callback_info info)
     (void)info;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
-        RefreshAdapterStateLocked();
+        // MihomoStart holds the adapter mutex while parsing. Keep state reads
+        // non-blocking during async startup so the VPN extension event loop
+        // can keep polling and process lifecycle callbacks.
+        if (!g_tunStartInProgress) {
+            RefreshAdapterStateLocked();
+        }
     }
     return CreateStateObject(env);
 }
@@ -433,6 +608,7 @@ static napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor desc[] = {
         { "startTun", nullptr, StartTun, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "startTunAsync", nullptr, StartTunAsync, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "stopTun", nullptr, StopTun, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "startCore", nullptr, StartCore, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "stopCore", nullptr, StopCore, nullptr, nullptr, nullptr, napi_default, nullptr },

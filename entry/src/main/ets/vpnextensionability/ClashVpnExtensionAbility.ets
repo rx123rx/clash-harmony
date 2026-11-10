@@ -69,7 +69,11 @@ export default class ClashVpnExtensionAbility extends VpnExtensionAbility {
       } catch (protectErr) {
         hilog.warn(DOMAIN, TAG, 'VPN process network protection failed: %{public}s', JSON.stringify(protectErr));
       }
-      const coreState: CoreBridgeState = CoreBridgeService.startTun(this.configPath, this.tunFd);
+      let coreState: CoreBridgeState = CoreBridgeService.startTunAsync(this.configPath, this.tunFd);
+      if (coreState.coreMode === 'starting') {
+        hilog.info(DOMAIN, TAG, 'Native core startup moved to background worker');
+        coreState = await CoreBridgeService.waitForTunStart(240, 500);
+      }
       if (!coreState.running) {
         hilog.error(DOMAIN, TAG, 'Native core bridge failed: error=%{public}s adapter=%{public}s adapterKind=%{public}s loadError=%{public}s nativeFd=%{public}d',
           coreState.lastError, coreState.adapterMode, coreState.adapterKind, coreState.adapterLoadError, coreState.nativeFd);
